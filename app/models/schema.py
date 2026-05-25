@@ -29,6 +29,13 @@ class VideoTransitionMode(str, Enum):
     slide_out = "SlideOut"
 
 
+class ScriptStyle(str, Enum):
+    douyin = "douyin"
+    explainer = "explainer"
+    story = "story"
+    knowledge = "knowledge"
+
+
 class VideoAspect(str, Enum):
     landscape = "16:9"
     portrait = "9:16"
@@ -74,7 +81,7 @@ class VideoParams(BaseModel):
     video_script: str = ""  # Script used to generate the video
     video_terms: Optional[str | list] = None  # Keywords used to generate the video
     video_aspect: Optional[VideoAspect] = VideoAspect.portrait.value
-    video_concat_mode: Optional[VideoConcatMode] = VideoConcatMode.random.value
+    video_concat_mode: Optional[VideoConcatMode] = VideoConcatMode.sequential.value
     video_transition_mode: Optional[VideoTransitionMode] = None
     video_clip_duration: Optional[int] = 5
     video_count: Optional[int] = 1
@@ -106,6 +113,9 @@ class VideoParams(BaseModel):
     stroke_width: float = 1.5
     n_threads: Optional[int] = 2
     paragraph_number: Optional[int] = 3
+    script_style: Optional[ScriptStyle] = ScriptStyle.douyin.value
+    target_duration: Optional[int] = 60
+    enable_scene_matching: Optional[bool] = True
 
 
 class SubtitleRequest(BaseModel):
@@ -152,6 +162,8 @@ class VideoScriptParams:
     video_subject: Optional[str] = "春天的花海"
     video_language: Optional[str] = ""
     paragraph_number: Optional[int] = 3
+    script_style: Optional[ScriptStyle] = ScriptStyle.douyin.value
+    target_duration: Optional[int] = 60
 
 
 class VideoTermsParams:
@@ -190,6 +202,11 @@ class VideoScriptRequest(VideoScriptParams, BaseModel):
 
 class VideoTermsRequest(VideoTermsParams, BaseModel):
     pass
+
+
+class DouyinPublishRequest(BaseModel):
+    video_path: str
+    title: str = ""
 
 
 ######################################################################################################

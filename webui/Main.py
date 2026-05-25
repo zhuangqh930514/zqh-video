@@ -1,6 +1,8 @@
 import json
 import os
 import platform
+import re
+import shutil
 import subprocess
 import sys
 import threading
@@ -22,12 +24,13 @@ from app.config import config
 from app.models import const
 from app.models.schema import (
     MaterialInfo,
+    ScriptStyle,
     VideoAspect,
     VideoConcatMode,
     VideoParams,
     VideoTransitionMode,
 )
-from app.services import llm, voice
+from app.services import douyin, llm, voice
 from app.services import state as sm
 from app.services import task as tm
 from app.utils import utils
@@ -90,8 +93,20 @@ if "local_video_materials" not in st.session_state:
     st.session_state["local_video_materials"] = []
 if "latest_task_id" not in st.session_state:
     st.session_state["latest_task_id"] = None
+if "suggested_topics_by_category" not in st.session_state:
+    st.session_state["suggested_topics_by_category"] = config.ui.get(
+        "suggested_topics_by_category", {}
+    ) or {}
+if "suggested_topics_category" not in st.session_state:
+    st.session_state["suggested_topics_category"] = config.ui.get(
+        "suggested_topics_category", ""
+    )
 if "suggested_topics" not in st.session_state:
-    st.session_state["suggested_topics"] = None
+    cached_category = st.session_state.get("suggested_topics_category", "")
+    cached_topics = st.session_state["suggested_topics_by_category"].get(
+        cached_category
+    )
+    st.session_state["suggested_topics"] = cached_topics
 if "batch_task_ids" not in st.session_state:
     st.session_state["batch_task_ids"] = []
 if "pending_batch_count" not in st.session_state:
@@ -244,6 +259,96 @@ def tr(key):
 
 # ========== Task History Helper ==========
 TASK_STATE_ICONS = {-1: "❌", 1: "✅", 4: "⏳"}
+TASK_TITLE_MAX_LEN = 24
+
+
+def extract_task_core_title(script: str = "", video_subject: str = "") -> str:
+    topic = (video_subject or "").strip()
+    if topic:
+        return " ".join(topic.split())
+
+    text = (script or "").strip()
+    if not text:
+        return ""
+
+    first_para = text.split("\n\n")[0].split("\n")[0].strip()
+    for prefix in (
+        "每天一个小知识，今天是",
+        "每天一个小知识，",
+        "每天一个小知识",
+    ):
+        if first_para.startswith(prefix):
+            first_para = first_para[len(prefix):].lstrip("，, ")
+            break
+
+    if first_para.startswith("今天是"):
+        first_para = first_para[3:].lstrip("，, ")
+
+    for sep in "。！？!?":
+        if sep in first_para:
+            first_para = first_para.split(sep)[0]
+            break
+
+    first_para = first_para.strip("，,。！？!? ")
+    if first_para:
+        return " ".join(first_para.split())
+    return " ".join(text.replace("\n", " ").split())
+
+
+def extract_task_display_title(script: str = "", video_subject: str = "") -> str:
+    core_title = extract_task_core_title(script, video_subject)
+    return _truncate_task_title(core_title) if core_title else ""
+
+
+def sanitize_download_filename(name: str) -> str:
+    name = " ".join((name or "").strip().split())
+    name = re.sub(r'[\\/:*?"<>|]', "", name)
+    return name[:80] or "video"
+
+
+def build_video_download_filename(title: str, index: int = 0, total: int = 1) -> str:
+    base = sanitize_download_filename(title)
+    if total > 1:
+        base = f"{base}-{index + 1}"
+    return f"{base}.mp4"
+
+
+def render_video_with_download(
+    video_path: str,
+    download_title: str,
+    key_suffix: str,
+    index: int = 0,
+    total: int = 1,
+):
+    filename = build_video_download_filename(download_title or "video", index, total)
+    is_remote = video_path.startswith("http://") or video_path.startswith("https://")
+
+    if is_remote:
+        st.video(video_path)
+        st.caption(filename)
+        return
+
+    if not os.path.exists(video_path):
+        st.warning(tr("Video file not found"))
+        return
+
+    st.video(video_path)
+    with open(video_path, "rb") as video_file:
+        st.download_button(
+            "⬇️ " + tr("Download Video"),
+            data=video_file.read(),
+            file_name=filename,
+            mime="video/mp4",
+            key=f"download_video_{key_suffix}",
+            use_container_width=True,
+        )
+
+
+def _truncate_task_title(title: str, max_len: int = TASK_TITLE_MAX_LEN) -> str:
+    title = " ".join(title.split())
+    if len(title) <= max_len:
+        return title
+    return title[:max_len].rstrip() + "…"
 
 
 def get_task_list():
@@ -281,8 +386,10 @@ def get_task_list():
             if task_state != const.TASK_STATE_PROCESSING and not video_files:
                 continue
 
-            # 读取文案摘要
+            # 读取文案摘要与主题
             script_subject = ""
+            script_content = ""
+            video_subject = ""
             script_file = os.path.join(task_dir, "script.json")
             if os.path.exists(script_file):
                 try:
@@ -290,12 +397,19 @@ def get_task_list():
                         script_data = json.loads(f.read())
                         script_content = script_data.get("script", "")
                         script_subject = script_content[:80]
+                        video_subject = (script_data.get("params") or {}).get("video_subject", "")
                 except Exception:
                     pass
+
+            download_title = extract_task_core_title(script_content, video_subject)
+            display_title = _truncate_task_title(download_title) if download_title else ""
 
             task_list.append({
                 "task_id": task_id,
                 "subject": script_subject,
+                "display_title": display_title,
+                "download_title": download_title,
+                "video_subject": video_subject,
                 "videos": video_files,
                 "state": task_state,
                 "progress": task_progress,
@@ -335,20 +449,66 @@ def get_historical_subjects():
     return subjects
 
 
+def default_douyin_redirect_uri() -> str:
+    return f"http://127.0.0.1:{config.listen_port}/api/v1/douyin/oauth/callback"
+
+
+def render_douyin_publish_section(video_paths, title: str, key_prefix: str = ""):
+    if not config.app.get("douyin_enabled", False):
+        return
+
+    st.markdown("---")
+    st.subheader("📤 " + tr("Publish to Douyin"))
+
+    service = douyin.douyin_service
+    if not service.is_configured():
+        st.info(tr("Douyin setup help"))
+        return
+
+    if service.is_authorized():
+        st.success(tr("Douyin Authorized"))
+    else:
+        st.warning(tr("Douyin Not Authorized"))
+        auth_url = service.get_auth_url()
+        st.link_button("🔗 " + tr("Connect Douyin Account"), auth_url)
+        st.caption(tr("Douyin setup help"))
+        return
+
+    publish_title = title or "每天一个小知识"
+    for index, video_path in enumerate(video_paths or []):
+        local_path = video_path
+        if local_path.startswith("http://") or local_path.startswith("https://"):
+            continue
+        if not os.path.exists(local_path):
+            continue
+        button_key = f"{key_prefix}douyin_publish_{index}_{os.path.basename(local_path)}"
+        if st.button("🚀 " + tr("Publish to Douyin") + f" — {os.path.basename(local_path)}", key=button_key):
+            with st.spinner(tr("Publishing to Douyin...")):
+                result = douyin.publish_to_douyin(local_path, publish_title)
+            if result.get("success"):
+                st.success(tr("Douyin publish succeeded"))
+                if result.get("item_id"):
+                    st.caption(f"item_id: {result.get('item_id')}")
+            else:
+                st.error(tr("Douyin publish failed") + f": {result.get('error', 'Unknown error')}")
+                if result.get("auth_url"):
+                    st.link_button("🔗 " + tr("Connect Douyin Account"), result["auth_url"])
+
+
 def launch_batch(batch_count, topic_category, params):
     """Start a batch after all UI controls have populated params."""
     config.save_config()
     if (
         not params.video_source
         or params.video_source
-        not in ["pexels", "pixabay", "coverr", "videvo", "ai_generated", "local"]
+        not in ["pexels", "pixabay", "pexels_img", "pixabay_img", "coverr", "videvo", "ai_generated", "local"]
     ):
         st.error(tr("Please Select a Valid Video Source"))
         return
-    if params.video_source == "pexels" and not config.app.get("pexels_api_keys", ""):
+    if params.video_source in ("pexels", "pexels_img") and not config.app.get("pexels_api_keys", ""):
         st.error(tr("Please Enter the Pexels API Key"))
         return
-    if params.video_source == "pixabay" and not config.app.get("pixabay_api_keys", ""):
+    if params.video_source in ("pixabay", "pixabay_img") and not config.app.get("pixabay_api_keys", ""):
         st.error(tr("Please Enter the Pixabay API Key"))
         return
     if params.video_source == "coverr" and not config.app.get("coverr_api_key", ""):
@@ -438,6 +598,32 @@ def task_status_text(state, progress):
     return ""
 
 
+def delete_history_tasks(task_ids):
+    """Delete persisted task folders and clear cached state."""
+    tasks_dir = utils.storage_dir("tasks")
+    running_ids = set(st.session_state.get("batch_task_ids", []))
+    current_task_id = st.session_state.get("current_task_id")
+    if st.session_state.get("task_running") and current_task_id:
+        running_ids.add(current_task_id)
+
+    deleted = []
+    skipped = []
+    errors = []
+    for task_id in task_ids:
+        if task_id in running_ids:
+            skipped.append(task_id)
+            continue
+        try:
+            task_dir = os.path.join(tasks_dir, task_id)
+            if os.path.isdir(task_dir):
+                shutil.rmtree(task_dir)
+            sm.state.delete_task(task_id)
+            deleted.append(task_id)
+        except Exception as exc:
+            errors.append((task_id, str(exc)))
+    return deleted, skipped, errors
+
+
 # ========== Sidebar — Task History ==========
 with st.sidebar:
     st.header("🎬 " + tr("Task History"))
@@ -458,15 +644,10 @@ with st.sidebar:
         task_options = []
         for t in tasks:
             icon = TASK_STATE_ICONS.get(t["state"], "🕐")
-            short_id = t["task_id"][:8]
             status_str = task_status_text(t["state"], t["progress"])
-            subject = (
-                t["subject"][:30] + ("…" if len(t["subject"]) > 30 else "")
-                if t["subject"]
-                else tr("No subject")
-            )
-            label = f"{icon} {short_id} — {subject}"
-            if status_str:
+            title = t.get("display_title") or tr("No subject")
+            label = f"{icon} {title}"
+            if t["state"] in (const.TASK_STATE_PROCESSING, const.TASK_STATE_FAILED) and status_str:
                 label += f" ({status_str})"
             task_options.append(label)
 
@@ -495,6 +676,50 @@ with st.sidebar:
             error_msg = selected_task.get("error")
             st.error(f"❌ {tr('Failed')}" + (f": {error_msg}" if error_msg else ""))
 
+        st.divider()
+
+        # --- Batch delete tasks ---
+        batch_delete_indices = st.multiselect(
+            tr("Batch Delete Tasks"),
+            options=range(len(tasks)),
+            format_func=lambda i: task_options[i],
+            key="batch_delete_task_indices",
+        )
+        batch_delete_ids = [tasks[i]["task_id"] for i in batch_delete_indices]
+        batch_delete_key = "confirm_batch_delete_tasks"
+        if st.button(
+            "🗑️ " + tr("Delete Selected Tasks"),
+            key="delete_selected_tasks_btn",
+            disabled=not batch_delete_ids,
+            use_container_width=True,
+        ):
+            st.session_state[batch_delete_key] = batch_delete_ids
+
+        if st.session_state.get(batch_delete_key):
+            pending_delete_ids = st.session_state[batch_delete_key]
+            st.warning(
+                tr("Confirm deleting selected tasks")
+                + f": {len(pending_delete_ids)}"
+            )
+            col_yes, col_no = st.columns(2)
+            with col_yes:
+                if st.button("✅ " + tr("Confirm"), key="confirm_batch_del"):
+                    deleted, skipped, errors = delete_history_tasks(pending_delete_ids)
+                    st.session_state.pop(batch_delete_key, None)
+                    if st.session_state.get("selected_task", {}).get("task_id") in deleted:
+                        st.session_state["selected_task"] = None
+                    if deleted:
+                        st.success(tr("Deleted tasks") + f": {len(deleted)}")
+                    if skipped:
+                        st.warning(tr("Skipped running tasks") + f": {len(skipped)}")
+                    if errors:
+                        st.error("; ".join(f"{tid[:8]}: {err}" for tid, err in errors))
+                    st.rerun()
+            with col_no:
+                if st.button("❌ " + tr("Cancel"), key="cancel_batch_del"):
+                    st.session_state.pop(batch_delete_key, None)
+                    st.rerun()
+
         # --- Delete task ---
         delete_key = "confirm_delete_task"
         if st.button("🗑️ " + tr("Delete Task"), key="delete_task_btn"):
@@ -504,16 +729,15 @@ with st.sidebar:
             col_yes, col_no = st.columns(2)
             with col_yes:
                 if st.button("✅ " + tr("Confirm"), key="confirm_del"):
-                    try:
-                        import shutil
-                        task_dir = os.path.join(utils.storage_dir("tasks"), selected_task["task_id"])
-                        if os.path.isdir(task_dir):
-                            shutil.rmtree(task_dir)
-                            st.session_state.pop(delete_key, None)
-                            st.session_state["selected_task"] = None
-                            st.rerun()
-                    except Exception as e:
-                        st.error(str(e))
+                    deleted, skipped, errors = delete_history_tasks([selected_task["task_id"]])
+                    st.session_state.pop(delete_key, None)
+                    if deleted:
+                        st.session_state["selected_task"] = None
+                        st.rerun()
+                    elif skipped:
+                        st.warning(tr("Skipped running tasks") + ": 1")
+                    elif errors:
+                        st.error(errors[0][1])
             with col_no:
                 if st.button("❌ " + tr("Cancel"), key="cancel_del"):
                     st.session_state.pop(delete_key, None)
@@ -813,6 +1037,55 @@ if not config.app.get("hide_config", False):
             )
             config.app["videvo_api_key"] = videvo_api_key
 
+with st.expander(tr("Douyin Settings"), expanded=False):
+    config.app["douyin_enabled"] = st.checkbox(
+        tr("Enable Douyin Publish"),
+        value=config.app.get("douyin_enabled", False),
+    )
+    config.app["douyin_client_key"] = st.text_input(
+        tr("Douyin Client Key"),
+        value=config.app.get("douyin_client_key", ""),
+    )
+    config.app["douyin_client_secret"] = st.text_input(
+        tr("Douyin Client Secret"),
+        value=config.app.get("douyin_client_secret", ""),
+        type="password",
+    )
+    default_redirect = config.app.get("douyin_redirect_uri") or default_douyin_redirect_uri()
+    config.app["douyin_redirect_uri"] = st.text_input(
+        tr("Douyin Redirect URI"),
+        value=default_redirect,
+    )
+    config.app["douyin_auto_publish"] = st.checkbox(
+        tr("Douyin Auto Publish"),
+        value=config.app.get("douyin_auto_publish", False),
+    )
+    private_options = [
+        (tr("Douyin Public"), 0),
+        (tr("Douyin Private"), 1),
+        (tr("Douyin Friends Only"), 2),
+    ]
+    saved_private = int(config.app.get("douyin_private_status", 0) or 0)
+    private_index = next((i for i, (_, value) in enumerate(private_options) if value == saved_private), 0)
+    selected_private = st.selectbox(
+        tr("Douyin Private Status"),
+        options=[label for label, _ in private_options],
+        index=private_index,
+    )
+    config.app["douyin_private_status"] = next(value for label, value in private_options if label == selected_private)
+
+    st.caption(tr("Douyin setup help"))
+    service = douyin.douyin_service
+    if service.is_configured():
+        if service.is_authorized():
+            st.success(tr("Douyin Authorized"))
+            if st.button("🔌 " + tr("Disconnect Douyin Account")):
+                service.clear_authorization()
+                st.rerun()
+        else:
+            st.warning(tr("Douyin Not Authorized"))
+            st.link_button("🔗 " + tr("Connect Douyin Account"), service.get_auth_url())
+
 llm_provider = config.app.get("llm_provider", "").lower()
 panel = st.columns(3)
 left_panel = panel[0]
@@ -831,11 +1104,24 @@ with left_panel:
             tr("Motivation"), tr("Nature"), tr("History"), tr("Psychology"),
             tr("Education"), tr("Life Skills"), tr("Business"), tr("AI"),
         ]
+        saved_topic_category = st.session_state.get("suggested_topics_category", "")
+        topic_category_index = (
+            TOPIC_CATEGORIES.index(saved_topic_category)
+            if saved_topic_category in TOPIC_CATEGORIES
+            else 0
+        )
         topic_category = st.selectbox(
             tr("Topic Category"),
             options=TOPIC_CATEGORIES,
+            index=topic_category_index,
             key="topic_category_sel",
         )
+        if st.session_state.get("suggested_topics_category") != topic_category:
+            st.session_state["suggested_topics_category"] = topic_category
+            st.session_state["suggested_topics"] = st.session_state[
+                "suggested_topics_by_category"
+            ].get(topic_category)
+            config.ui["suggested_topics_category"] = topic_category
 
         col_gen, col_ref = st.columns([1, 1])
         with col_gen:
@@ -843,12 +1129,23 @@ with left_panel:
         with col_ref:
             refresh_topics = st.button("🔄 " + tr("Refresh"), use_container_width=True)
 
-        if gen_topics or refresh_topics:
+        if gen_topics and st.session_state["suggested_topics_by_category"].get(topic_category):
+            st.session_state["suggested_topics"] = st.session_state[
+                "suggested_topics_by_category"
+            ][topic_category]
+        elif gen_topics or refresh_topics:
             with st.spinner(tr("Generating topic ideas...")):
                 historical = get_historical_subjects()
                 generated = llm.generate_topics(category=topic_category, count=20, exclude_subjects=historical)
                 if generated and "Error: " not in generated[0]:
                     st.session_state["suggested_topics"] = generated
+                    st.session_state["suggested_topics_category"] = topic_category
+                    st.session_state["suggested_topics_by_category"][topic_category] = generated
+                    config.ui["suggested_topics_category"] = topic_category
+                    config.ui["suggested_topics_by_category"] = st.session_state[
+                        "suggested_topics_by_category"
+                    ]
+                    config.save_config()
                     st.rerun()
                 else:
                     st.error(generated[0] if generated else tr("Generation failed"))
@@ -902,16 +1199,58 @@ with left_panel:
         )
         config.ui["paragraph_number"] = params.paragraph_number
 
+        script_styles = [
+            (tr("Douyin retention"), ScriptStyle.douyin.value),
+            (tr("Explainer"), ScriptStyle.explainer.value),
+            (tr("Storytelling"), ScriptStyle.story.value),
+            (tr("Knowledge sharing"), ScriptStyle.knowledge.value),
+        ]
+        saved_script_style = config.ui.get("script_style", ScriptStyle.douyin.value)
+        saved_script_style_values = [style[1] for style in script_styles]
+        script_style_index = (
+            saved_script_style_values.index(saved_script_style)
+            if saved_script_style in saved_script_style_values
+            else 0
+        )
+        selected_script_style = st.selectbox(
+            tr("Script Style"),
+            options=range(len(script_styles)),
+            format_func=lambda x: script_styles[x][0],
+            index=script_style_index,
+        )
+        params.script_style = ScriptStyle(script_styles[selected_script_style][1])
+        config.ui["script_style"] = params.script_style.value
+
+        saved_target_duration = config.ui.get("target_duration", 60)
+        params.target_duration = st.slider(
+            tr("Target Duration (seconds)"),
+            min_value=15,
+            max_value=180,
+            value=saved_target_duration,
+            step=5,
+        )
+        config.ui["target_duration"] = params.target_duration
+
         if st.button(
             tr("Generate Video Script and Keywords"), key="auto_generate_script"
         ):
             with st.spinner(tr("Generating Video Script and Keywords")):
-                script = llm.generate_script(
+                script, terms = llm.generate_script_and_terms(
                     video_subject=params.video_subject,
                     language=params.video_language,
                     paragraph_number=params.paragraph_number,
+                    script_style=params.script_style.value,
+                    target_duration=params.target_duration,
                 )
-                terms = llm.generate_terms(params.video_subject, script)
+                if not script or not terms:
+                    script = llm.generate_script(
+                        video_subject=params.video_subject,
+                        language=params.video_language,
+                        paragraph_number=params.paragraph_number,
+                        script_style=params.script_style.value,
+                        target_duration=params.target_duration,
+                    )
+                    terms = llm.generate_terms(params.video_subject, script)
                 if "Error: " in script:
                     st.error(tr(script))
                 elif "Error: " in terms:
@@ -963,15 +1302,14 @@ with middle_panel:
             (tr("Random"), "random"),
         ]
         video_sources = [
-            (tr("Pexels"), "pexels"),
-            (tr("Pixabay"), "pixabay"),
+            (tr("Pexels Images (图片为主)"), "pexels_img"),
+            (tr("Pixabay Images (图片为主)"), "pixabay_img"),
+            (tr("Pexels Videos"), "pexels"),
+            (tr("Pixabay Videos"), "pixabay"),
             (tr("Coverr"), "coverr"),
             (tr("Videvo"), "videvo"),
             (tr("AI Generated"), "ai_generated"),
             (tr("Local file"), "local"),
-            (tr("TikTok"), "douyin"),
-            (tr("Bilibili"), "bilibili"),
-            (tr("Xiaohongshu"), "xiaohongshu"),
         ]
 
         saved_video_source_name = config.app.get("video_source", "pexels")
@@ -1002,7 +1340,7 @@ with middle_panel:
 
         selected_index = st.selectbox(
             tr("Video Concat Mode"),
-            index=1,
+            index=0,
             options=range(
                 len(video_concat_modes)
             ),  # Use the index as the internal option value
@@ -1056,6 +1394,12 @@ with middle_panel:
             options=[1, 2, 3, 4, 5],
             index=0,
         )
+        params.enable_scene_matching = st.checkbox(
+            tr("Match materials to script scenes"),
+            value=config.ui.get("enable_scene_matching", True),
+            help=tr("Generate scene-level keywords and bind each script paragraph to its own materials."),
+        )
+        config.ui["enable_scene_matching"] = params.enable_scene_matching
     with st.container(border=True):
         st.write(tr("Audio Settings"))
 
@@ -1431,8 +1775,17 @@ with right_panel:
         st.session_state["pending_batch_category"] = ""
         launch_batch(pending_batch_count, pending_batch_category, params)
 
-    start_button = st.button(tr("Generate Video"), use_container_width=True, type="primary")
-    if start_button:
+    action_cols = st.columns([1, 1])
+    with action_cols[0]:
+        preview_materials_button = st.button(
+            tr("Preview Materials"),
+            use_container_width=True,
+        )
+    with action_cols[1]:
+        start_button = st.button(tr("Generate Video"), use_container_width=True, type="primary")
+
+    if start_button or preview_materials_button:
+        stop_at = "materials" if preview_materials_button else "video"
         config.save_config()
         task_id = str(uuid4())
         if not params.video_subject and not params.video_script:
@@ -1440,17 +1793,17 @@ with right_panel:
             scroll_to_bottom()
             st.stop()
 
-        if params.video_source not in ["pexels", "pixabay", "coverr", "videvo", "ai_generated", "local"]:
+        if params.video_source not in ["pexels", "pixabay", "pexels_img", "pixabay_img", "coverr", "videvo", "ai_generated", "local"]:
             st.error(tr("Please Select a Valid Video Source"))
             scroll_to_bottom()
             st.stop()
 
-        if params.video_source == "pexels" and not config.app.get("pexels_api_keys", ""):
+        if params.video_source in ("pexels", "pexels_img") and not config.app.get("pexels_api_keys", ""):
             st.error(tr("Please Enter the Pexels API Key"))
             scroll_to_bottom()
             st.stop()
 
-        if params.video_source == "pixabay" and not config.app.get("pixabay_api_keys", ""):
+        if params.video_source in ("pixabay", "pixabay_img") and not config.app.get("pixabay_api_keys", ""):
             st.error(tr("Please Enter the Pixabay API Key"))
             scroll_to_bottom()
             st.stop()
@@ -1527,7 +1880,7 @@ with right_panel:
         logger.info(utils.to_json(params))
 
         # 后台线程执行，不阻塞 UI
-        task_thread = utils.run_in_background(tm.start, task_id=task_id, params=params)
+        task_thread = utils.run_in_background(tm.start, task_id=task_id, params=params, stop_at=stop_at)
         st.session_state["task_thread_id"] = task_thread.ident
         st.session_state["task_start_time"] = time.time()
 
@@ -1582,8 +1935,12 @@ if st.session_state.get("task_running"):
         if done < total:
             current_sd = sm.state.get_task(current_tid) if current_tid else {}
             cur_progress = current_sd.get("progress", 0) if current_sd else 0
+            cur_message = current_sd.get("message", "") if current_sd else ""
             batch_progress = (done * 100 + cur_progress) / total
-            progress_text = f"📦 {tr('Batch')} [{done}/{total}] | {tr('Processing')}… {cur_progress}% | ID: {(current_tid or '')[:8]}"
+            progress_text = f"📦 {tr('Batch')} [{done}/{total}]"
+            if cur_message:
+                progress_text += f" | {cur_message}"
+            progress_text += f" | {cur_progress}% | ID: {(current_tid or '')[:8]}"
             st.progress(min(batch_progress, 100) / 100, text=progress_text)
 
         # Check if batch is complete
@@ -1596,6 +1953,12 @@ if st.session_state.get("task_running"):
                 st.success(tr("Batch generation completed") + f" — {success_count}/{total} {tr('videos succeed')}")
             if failed > 0:
                 st.warning(f"{failed}/{total} {tr('videos failed')}")
+                for tid in batch_ids:
+                    sd = sm.state.get_task(tid)
+                    if sd and sd.get("state") == const.TASK_STATE_FAILED:
+                        err = sd.get("error", "")
+                        if err:
+                            st.caption(f"❌ {tid[:8]}: {err[:120]}")
 
             # Show all generated videos
             all_videos = []
@@ -1610,8 +1973,29 @@ if st.session_state.get("task_running"):
                 cols = st.columns(min(len(all_videos), 3))
                 for i, (tid, url) in enumerate(all_videos):
                     with cols[i % 3]:
-                        st.caption(f"{tid[:8]} — {os.path.basename(url)}")
-                        st.video(url)
+                        sd = sm.state.get_task(tid) or {}
+                        params_data = sd.get("params") or {}
+                        title = extract_task_core_title(
+                            sd.get("script", ""),
+                            params_data.get("video_subject", ""),
+                        ) or params.video_subject or os.path.basename(url)
+                        task_videos = sd.get("videos", [url])
+                        video_index = task_videos.index(url) if url in task_videos else 0
+                        render_video_with_download(
+                            url,
+                            title,
+                            key_suffix=f"batch_{tid}_{video_index}",
+                            index=video_index,
+                            total=len(task_videos),
+                        )
+                for tid in batch_ids:
+                    sd = sm.state.get_task(tid)
+                    if sd and sd.get("state") == const.TASK_STATE_COMPLETE:
+                        render_douyin_publish_section(
+                            sd.get("videos", []),
+                            sd.get("params", {}).get("video_subject", params.video_subject),
+                            key_prefix=f"batch_done_{tid}_",
+                        )
             _cleanup_log_handler()
 
         # Batch thread liveness check
@@ -1673,8 +2057,11 @@ if st.session_state.get("task_running"):
         if task_state_data:
             state = task_state_data.get("state")
             progress = task_state_data.get("progress", 0)
+            message = task_state_data.get("message", "")
 
-            progress_text = f"{tr('Processing')}… {progress}% | {tr('Task')}: {task_id[:8]}"
+            progress_text = message if message else f"{tr('Processing')}… {progress}% | {tr('Task')}: {task_id[:8]}"
+            if message:
+                progress_text += f"  ({progress}%)"
             st.progress(min(progress, 100) / 100, text=progress_text)
 
             if state == const.TASK_STATE_COMPLETE:
@@ -1685,10 +2072,43 @@ if st.session_state.get("task_running"):
                 video_files = task_state_data.get("videos", [])
                 if video_files:
                     cols = st.columns(min(len(video_files), 3))
+                    download_title = params.video_subject or extract_task_core_title(
+                        task_state_data.get("script", ""),
+                        params.video_subject,
+                    )
                     for i, url in enumerate(video_files):
                         with cols[i % 3]:
-                            st.caption(os.path.basename(url))
-                            st.video(url)
+                            render_video_with_download(
+                                url,
+                                download_title,
+                                key_suffix=f"single_done_{task_id}_{i}",
+                                index=i,
+                                total=len(video_files),
+                            )
+                    render_douyin_publish_section(
+                        video_files,
+                        params.video_subject,
+                        key_prefix=f"single_done_{task_id}_",
+                    )
+                scenes = task_state_data.get("scenes", [])
+                if scenes and not video_files:
+                    st.subheader(tr("Material Preview"))
+                    for scene in scenes:
+                        with st.expander(
+                            f"{tr('Scene')} {scene.get('index', '')}: {scene.get('start', 0)}s - {scene.get('end', 0)}s",
+                            expanded=True,
+                        ):
+                            if scene.get("terms"):
+                                st.caption(", ".join(scene.get("terms", [])))
+                            if scene.get("script"):
+                                st.write(scene.get("script"))
+                            material_paths = scene.get("materials") or []
+                            if material_paths:
+                                cols = st.columns(min(len(material_paths), 3))
+                                for i, material_path in enumerate(material_paths):
+                                    with cols[i % 3]:
+                                        st.caption(os.path.basename(material_path))
+                                        st.video(material_path)
                 open_task_folder(task_id)
                 _cleanup_log_handler()
 
@@ -1750,16 +2170,32 @@ if selected_task and selected_task.get("videos"):
     st.subheader("🎬 " + tr("Generated Videos"))
     short_id = selected_task["task_id"][:8]
     st.caption(f"{tr('Task')}: {short_id}")
-    if selected_task.get("subject"):
-        st.write(f"**{tr('Script')}**: {selected_task['subject']}")
+    if selected_task.get("display_title") or selected_task.get("subject"):
+        st.write(f"**{tr('Script')}**: {selected_task.get('display_title') or selected_task.get('subject')}")
 
     video_files = selected_task["videos"]
+    download_title = (
+        selected_task.get("download_title")
+        or selected_task.get("video_subject")
+        or selected_task.get("display_title")
+        or "video"
+    )
     cols = st.columns(min(len(video_files), 3))
     for i, video_path in enumerate(video_files):
         col_idx = i % 3
         with cols[col_idx]:
-            video_name = os.path.basename(video_path)
-            st.caption(video_name)
-            st.video(video_path)
+            render_video_with_download(
+                video_path,
+                download_title,
+                key_suffix=f"history_{selected_task['task_id']}_{i}",
+                index=i,
+                total=len(video_files),
+            )
+
+    render_douyin_publish_section(
+        video_files,
+        selected_task.get("video_subject") or selected_task.get("display_title", ""),
+        key_prefix=f"history_{selected_task['task_id']}_",
+    )
 
 config.save_config()

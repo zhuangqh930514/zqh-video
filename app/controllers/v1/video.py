@@ -196,6 +196,18 @@ def get_task(
             for v in combined_videos:
                 urls.append(file_to_uri(v))
             task["combined_videos"] = urls
+        if "materials" in task and isinstance(task["materials"], list):
+            materials = []
+            for m in task["materials"]:
+                materials.append(file_to_uri(m) if isinstance(m, str) else m)
+            task["materials"] = materials
+        if "scenes" in task and isinstance(task["scenes"], list):
+            for scene in task["scenes"]:
+                if isinstance(scene, dict) and isinstance(scene.get("materials"), list):
+                    scene["materials"] = [
+                        file_to_uri(m) if isinstance(m, str) else m
+                        for m in scene["materials"]
+                    ]
         return utils.get_response(200, task)
 
     raise HttpException(

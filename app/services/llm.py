@@ -2,6 +2,7 @@ import json
 import logging
 import re
 import requests
+import time
 from typing import List
 
 import g4f
@@ -14,6 +15,24 @@ from app.config import config
 _max_retries = 5
 _DEFAULT_GEMINI_MODEL = "gemini-2.5-flash"
 _DEPRECATED_GEMINI_MODELS = {"gemini-pro", "gemini-1.0-pro"}
+
+
+def _parse_json_object_response(response: str) -> dict:
+    if not response:
+        return {}
+    cleaned = response.strip()
+    cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\s*```$", "", cleaned)
+    try:
+        return json.loads(cleaned)
+    except Exception:
+        match = re.search(r"\{.*\}", cleaned, flags=re.DOTALL)
+        if not match:
+            return {}
+        try:
+            return json.loads(match.group())
+        except Exception:
+            return {}
 
 
 def _normalize_text_response(content, llm_provider: str) -> str:
@@ -387,31 +406,62 @@ def _generate_response(prompt: str) -> str:
         return f"Error: {str(e)}"
 
 
+def _script_style_instruction(script_style: str) -> str:
+    style = (script_style or "douyin").strip().lower()
+    style_map = {
+        "douyin": """
+## Style: Douyin retention
+Use a direct opening, fast rhythm, clear information, and strong retention pressure.
+Avoid generic openings like "今天我们来聊聊" or "大家好".
+""",
+        "explainer": """
+## Style: Explainer
+Use clear cause-effect explanations, concrete analogies, and a calm educational rhythm.
+Prioritize accuracy and visualizable examples over exaggerated claims.
+""",
+        "story": """
+## Style: Storytelling
+Use a beginning, turning point, and payoff. Make each paragraph feel like the next beat in a story.
+Keep the narration vivid and easy to visualize.
+""",
+        "knowledge": """
+## Style: Knowledge sharing
+Use practical insights, numbered takeaways, and concise examples.
+Make the viewer feel they learned something useful immediately.
+""",
+    }
+    return style_map.get(style, style_map["douyin"]).strip()
+
+
 def generate_script(
-    video_subject: str, language: str = "", paragraph_number: int = 3
+    video_subject: str,
+    language: str = "",
+    paragraph_number: int = 3,
+    script_style: str = "douyin",
+    target_duration: int = 60,
 ) -> str:
     prompt = f"""
-# Role: Douyin Short Video Script Writer
+# Role: Short Video Script Writer
 
 ## Platform Context:
-This script is for a Douyin (抖音) short video. The audience has a very short attention span — if the first 2 seconds are not captivating, they will swipe away immediately. Every sentence must fight for retention.
+This script is for a short video. The audience has a very short attention span, so every sentence must be specific, visual, and useful.
 
 ## Goals:
-Write a highly engaging voiceover script optimized for Douyin's algorithm (high 2-second retention rate, high 5-second watch rate).
+Write a highly engaging voiceover script that can be paired with stock footage or image-based motion clips.
 
-## Douyin Script Structure:
-1. Hook (first 1-2 sentences, ~2 seconds): Must immediately grab attention. Use ONE of these techniques:
-   - Bold claim: "你可能每天都在做这件事，但完全做错了"
-   - Curiosity gap: "这个问题，99%的人都答不上来"
-   - Direct challenge: "如果你的答案是A，那你已经被骗了很久了"
-   - Number tease: "记住这三个字，你的生活会完全不同"
-   - Counter-intuitive: "这个东西越贵反而越害你"
-   - Personal address: "你相信吗？其实..."
-   DO NOT use generic openings like "今天我们来聊聊" "大家好欢迎收看" "你知道吗" (too overused).
+{_script_style_instruction(script_style)}
+
+## Script Structure:
+1. Opening:
+   - The very first sentence MUST use this exact pattern: "每天一个小知识，今天是XXXX。"
+   - Replace XXXX with the concrete subject being explained.
+   - Do not start with a question, curiosity gap, or rhetorical setup.
+   - Open by directly stating the topic you will explain.
+   - DO NOT use generic openings like "今天我们来聊聊" "大家好欢迎收看" "你知道吗".
 
 2. Delivery (remaining paragraphs, ~3-5 seconds each):
    - Deliver the actual content with high information density
-   - Use short, punchy sentences — no sentence over 30 characters
+   - Use natural sentence length and avoid overly fragmented narration
    - Alternating rhythm: fact → example → insight → fact
    - No filler, no transition words like "那么" "所以呢" "接下来"
    - If listing items, announce the number upfront: "三个原因" "两个方法"
@@ -427,9 +477,11 @@ Write a highly engaging voiceover script optimized for Douyin's algorithm (high 
 5. Never reference this prompt, the paragraph count, or the script structure in your response.
 6. Respond in the same language as the video subject.
 7. Include specific examples, numbers, or surprising comparisons. Avoid vague statements.
-8. CRITICAL: No sentence over 30 characters. Break long ideas into multiple short sentences.
+8. Keep sentences readable and spoken-language friendly, but do not split every idea into tiny fragments.
 9. NO filler words: "那么" "所以呢" "接下来我们" "然后呢" "就是说" "其实呢".
 10. NO summary endings: "总的来说" "综上所述" "以上就是" "最后我想说".
+11. Target total speaking duration: about {target_duration} seconds. Adjust density, not paragraph count.
+12. The first sentence must not be a question.
 
 ## Video Subject
 {video_subject}
@@ -452,11 +504,11 @@ Write a highly engaging voiceover script optimized for Douyin's algorithm (high 
 
         paragraphs = re.split(r"\n\s*\n", response.strip())
 
-        # Select the specified number of paragraphs
-        # selected_paragraphs = paragraphs[:paragraph_number]
+        selected_paragraphs = [
+            paragraph.strip() for paragraph in paragraphs if paragraph.strip()
+        ][:paragraph_number]
 
-        # Join the selected paragraphs into a single string
-        return "\n\n".join(paragraph.strip() for paragraph in paragraphs if paragraph.strip())
+        return "\n\n".join(selected_paragraphs)
 
     for i in range(_max_retries):
         try:
@@ -484,6 +536,87 @@ Write a highly engaging voiceover script optimized for Douyin's algorithm (high 
     return final_script.strip()
 
 
+def generate_script_and_terms(
+    video_subject: str,
+    language: str = "",
+    paragraph_number: int = 3,
+    script_style: str = "douyin",
+    target_duration: int = 60,
+    terms_amount: int = 12,
+) -> tuple[str, List[str]]:
+    prompt = f"""
+# Role: Short Video Planner
+
+## Goal
+Generate both:
+1. A short-video voiceover script.
+2. Stock-footage search terms for that exact script.
+
+This must be done in ONE response to reduce latency.
+
+{_script_style_instruction(script_style)}
+
+## Script Rules
+1. Exactly {paragraph_number} paragraph(s), separated by blank lines inside the JSON string.
+2. Each paragraph has 3-5 natural, information-dense sentences.
+3. No markdown, no title, no speaker labels.
+4. Respond in the same language as the video subject unless a language is specified.
+5. Target total speaking duration: about {target_duration} seconds.
+6. The very first sentence MUST use this exact pattern: "每天一个小知识，今天是XXXX。" Replace XXXX with the concrete subject being explained.
+7. Avoid overly fragmented narration; a sentence may be longer when the idea needs it.
+8. Do not start with a question, curiosity gap, or rhetorical setup. Open by directly stating the topic.
+9. No generic openings like "今天我们来聊聊", "大家好", or "你知道吗".
+
+## Search Term Rules
+1. Generate exactly {terms_amount} terms.
+2. Terms must be English strings, 1-4 words each.
+3. Terms must be concrete visible concepts suitable for Pexels/Pixabay.
+4. Include 2-3 terms directly representing the core subject.
+5. Avoid named brands, rare niche terms, or abstract concepts that cannot be seen.
+6. Cover different visual angles: subject close-up, environment, human action, tools/objects, wide scene.
+7. Do not fill the list with only generic atmosphere terms like "city street" or "people walking".
+
+## Output Format
+Return ONLY a JSON object:
+{{
+  "script": "paragraph 1\\n\\nparagraph 2",
+  "terms": ["term 1", "term 2"]
+}}
+
+## Video Subject
+{video_subject}
+""".strip()
+    if language:
+        prompt += f"\n## Language\n{language}"
+
+    logger.info(f"subject: {video_subject}")
+    start_time = time.perf_counter()
+    for i in range(min(_max_retries, 2)):
+        response = _generate_response(prompt=prompt)
+        data = _parse_json_object_response(response)
+        script = str(data.get("script", "")).strip()
+        terms = data.get("terms", [])
+        if isinstance(terms, list):
+            terms = [term.strip() for term in terms if isinstance(term, str) and term.strip()]
+        else:
+            terms = []
+
+        if script and terms:
+            elapsed = time.perf_counter() - start_time
+            logger.info(f"generated script and terms in one call: {elapsed:.2f}s")
+            paragraphs = [
+                paragraph.strip()
+                for paragraph in re.split(r"\n\s*\n", script)
+                if paragraph.strip()
+            ][:paragraph_number]
+            return "\n\n".join(paragraphs), terms[:terms_amount]
+
+        logger.warning(f"failed to parse combined script/terms response, trying again... {i + 1}")
+
+    logger.warning("combined script/terms generation failed, caller may fall back")
+    return "", []
+
+
 def generate_terms(video_subject: str, video_script: str, amount: int = 8) -> List[str]:
     prompt = f"""
 # Role: Stock Video Search Terms Generator
@@ -494,9 +627,18 @@ Generate {amount} search terms that will be used to query stock video libraries 
 ## Critical Rules:
 1. Return ONLY a JSON array of strings, nothing else.
 2. Each term must be 1-4 words in English.
-3. Terms must describe GENERIC visual concepts that commonly exist in stock footage libraries.
-4. Each term must correspond to a DIFFERENT visual scene or concept from the script — avoid generating multiple terms for the same idea.
-5. Terms should cover the FULL scope of the script — distribute them across all paragraphs/sections.
+3. Terms must describe CONCRETE, VISIBLE concepts that you are confident exist in stock footage libraries.
+4. Each term must correspond to a DIFFERENT visual scene or concept from the script — avoid multiple terms for the same idea.
+5. Terms should cover the FULL scope of the script — distribute them across all paragraphs/sections, with 2-3 different visual angles per important section when possible.
+6. CRITICAL: At least 2-3 terms must DIRECTLY represent the core subject matter — if the video is about comets, include "comet" and "comet tail".
+7. Prefer concrete subject-specific footage over generic filler. Only use broad fallback terms when the subject is hard to film.
+
+## Visual-First Thinking:
+Before writing each term, ask yourself:
+- "Can I clearly picture this in my mind?"
+- "Would a stock video library realistically have footage of this?"
+- "Is this something you can SEE, not just a concept?"
+If the answer to any question is NO, choose a different term.
 
 ## IMPORTANT - Stock Footage Awareness:
 Stock libraries have abundant footage of:
@@ -508,7 +650,7 @@ Stock libraries have abundant footage of:
 - Health/fitness: "running", "yoga", "meditation", "gym workout", "healthy food", "stretching"
 - Technology: "computer", "smartphone", "robot", "data center", "coding", "digital screen"
 - Abstract: "light bulb", "clock", "goal", "success", "teamwork", "growth", "journey"
-- Science/space: "galaxy", "microscope", "laboratory", "earth from space", "DNA helix"
+- Science/space: "galaxy", "microscope", "laboratory", "earth from space", "DNA helix", "comet", "astronaut", "satellite", "telescope", "nebula"
 - Animals: "bird flying", "fish swimming", "butterfly", "dog playing", "wildlife"
 - Travel: "airplane", "suitcase", "map", "beach", "mountain hiking", "road trip"
 - Emotions: "smiling face", "thinking person", "celebration", "lonely person", "excited crowd"
@@ -518,16 +660,20 @@ Stock libraries have abundant footage of:
 - Specific dishes: "Mapo Tofu", "Ramen", "Sushi"
 - Rare or niche activities unlikely to be in stock footage
 - Overly abstract terms that don't correspond to visible footage
+- Terms that are just synonyms of each other (e.g., don't use both "happy person" and "smiling face")
 
 ## Strategy - Step by Step:
 1. Read the entire video script carefully.
 2. For each paragraph, identify 1-2 key visual scenes or concepts it describes.
-3. For each visual scene, think: "What would I type into Pexels to find matching footage?"
-4. Translate each concept into a short, generic English search term (1-4 words).
-5. Ensure diversity: each term should represent a different visual element.
-6. Prioritize terms that are LIKELY to return abundant, high-quality results on stock sites.
+3. ALWAYS include the core subject as at least 2 variations: e.g., for "comets", use both "comet" and "comet night sky".
+4. For each visual scene, think: "What would I type into Pexels to find matching footage?"
+5. Translate each concept into a short, generic English search term (1-4 words).
+6. Ensure diversity: each term should represent a different visual element.
+7. Prioritize terms that are LIKELY to return abundant, high-quality results on stock sites.
+8. Mix shot types: subject close-up, wide environment, related object/tool, human action, and establishing scene.
 
 ## Examples:
+- Subject "comet" script → ["comet", "comet night sky", "starry sky", "telescope", "astronomy", "solar system", "nebula", "space galaxy"]
 - Subject "Sichuan hot pot" → ["cooking", "boiling pot", "eating together", "restaurant", "steam food", "spicy food", "family dinner", "food preparation"]
 - Subject "Tokyo travel guide" → ["city street", "night skyline", "people walking", "shopping district", "crosswalk", "subway train", "modern building", "japanese garden"]
 - Subject "benefits of meditation" → ["person meditating", "calm nature", "sunrise", "peaceful lake", "yoga", "deep breathing", "mindfulness", "forest"]

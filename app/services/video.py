@@ -1,5 +1,4 @@
 import glob
-import itertools
 import os
 import random
 import gc
@@ -207,7 +206,7 @@ def combine_videos(
     video_paths: List[str],
     audio_file: str,
     video_aspect: VideoAspect = VideoAspect.portrait,
-    video_concat_mode: VideoConcatMode = VideoConcatMode.random,
+    video_concat_mode: VideoConcatMode = VideoConcatMode.sequential,
     video_transition_mode: VideoTransitionMode = None,
     max_clip_duration: int = 5,
     threads: int = 2,
@@ -257,8 +256,7 @@ def combine_videos(
                 )
 
             start_time = end_time
-            if video_concat_mode.value == VideoConcatMode.sequential.value:
-                break
+            break
 
     # random subclipped_items order
     if video_concat_mode.value == VideoConcatMode.random.value:
@@ -338,16 +336,11 @@ def combine_videos(
         except Exception as e:
             logger.error(f"failed to process clip: {str(e)}")
 
-    # loop processed clips until the video duration matches or exceeds the audio duration.
     if video_duration < audio_duration:
-        logger.warning(f"video duration ({video_duration:.2f}s) is shorter than audio duration ({audio_duration:.2f}s), looping clips to match audio length.")
-        base_clips = processed_clips.copy()
-        for clip in itertools.cycle(base_clips):
-            if video_duration >= audio_duration:
-                break
-            processed_clips.append(clip)
-            video_duration += clip.duration
-        logger.info(f"video duration: {video_duration:.2f}s, audio duration: {audio_duration:.2f}s, looped {len(processed_clips)-len(base_clips)} clips")
+        logger.warning(
+            f"video duration ({video_duration:.2f}s) is shorter than audio duration "
+            f"({audio_duration:.2f}s); not looping clips to avoid repeated materials."
+        )
 
     # merge video clips progressively, avoid loading all videos at once to avoid memory overflow
     logger.info("starting clip merging process")
@@ -375,6 +368,162 @@ def combine_videos(
     delete_files(clip_files)
 
     logger.info("video combining completed")
+    return combined_video_path
+
+
+def combine_scene_videos(
+    combined_video_path: str,
+    scenes: List[dict],
+    audio_file: str,
+    video_aspect: VideoAspect = VideoAspect.portrait,
+    video_transition_mode: VideoTransitionMode = None,
+    max_clip_duration: int = 5,
+    threads: int = 2,
+) -> str:
+    audio_clip = AudioFileClip(audio_file)
+    try:
+        audio_duration = audio_clip.duration
+    finally:
+        close_clip(audio_clip)
+
+    transition_value = getattr(video_transition_mode, "value", video_transition_mode)
+    output_dir = os.path.dirname(combined_video_path)
+    aspect = VideoAspect(video_aspect)
+    video_width, video_height = aspect.to_resolution()
+    processed_clips = []
+
+    def make_subclip_items(material_paths: List[str]) -> List[SubClippedVideoClip]:
+        items = []
+        for material_path in material_paths:
+            clip = None
+            try:
+                clip = VideoFileClip(material_path)
+                clip_duration = clip.duration
+                clip_w, clip_h = clip.size
+            finally:
+                close_clip(clip)
+
+            start_time = 0
+            end_time = min(start_time + max_clip_duration, clip_duration)
+            if end_time > start_time:
+                items.append(
+                    SubClippedVideoClip(
+                        file_path=material_path,
+                        start_time=start_time,
+                        end_time=end_time,
+                        width=clip_w,
+                        height=clip_h,
+                    )
+                )
+        return items
+
+    def prepare_clip(subclipped_item: SubClippedVideoClip, duration_limit: float):
+        clip = VideoFileClip(subclipped_item.file_path).subclipped(
+            subclipped_item.start_time, subclipped_item.end_time
+        )
+        if clip.duration > duration_limit:
+            clip = clip.subclipped(0, duration_limit)
+
+        clip_duration = clip.duration
+        clip_w, clip_h = clip.size
+        if clip_w != video_width or clip_h != video_height:
+            clip_ratio = clip.w / clip.h
+            video_ratio = video_width / video_height
+            if clip_ratio == video_ratio:
+                clip = clip.resized(new_size=(video_width, video_height))
+            else:
+                scale_factor = video_width / clip_w if clip_ratio > video_ratio else video_height / clip_h
+                new_width = int(clip_w * scale_factor)
+                new_height = int(clip_h * scale_factor)
+                background = ColorClip(
+                    size=(video_width, video_height), color=(0, 0, 0)
+                ).with_duration(clip_duration)
+                clip_resized = clip.resized(new_size=(new_width, new_height)).with_position("center")
+                clip = CompositeVideoClip([background, clip_resized])
+
+        shuffle_side = random.choice(["left", "right", "top", "bottom"])
+        if transition_value in (None, VideoTransitionMode.none.value):
+            return clip
+        if transition_value == VideoTransitionMode.fade_in.value:
+            return video_effects.fadein_transition(clip, 1)
+        if transition_value == VideoTransitionMode.fade_out.value:
+            return video_effects.fadeout_transition(clip, 1)
+        if transition_value == VideoTransitionMode.slide_in.value:
+            return video_effects.slidein_transition(clip, 1, shuffle_side)
+        if transition_value == VideoTransitionMode.slide_out.value:
+            return video_effects.slideout_transition(clip, 1, shuffle_side)
+        if transition_value == VideoTransitionMode.shuffle.value:
+            return random.choice(
+                [
+                    lambda c: video_effects.fadein_transition(c, 1),
+                    lambda c: video_effects.fadeout_transition(c, 1),
+                    lambda c: video_effects.slidein_transition(c, 1, shuffle_side),
+                    lambda c: video_effects.slideout_transition(c, 1, shuffle_side),
+                ]
+            )(clip)
+        return clip
+
+    for scene_index, scene in enumerate(scenes, start=1):
+        material_paths = scene.get("materials") or []
+        scene_duration = float(scene.get("duration") or 0)
+        if not material_paths or scene_duration <= 0:
+            continue
+
+        subclip_items = make_subclip_items(material_paths)
+        if not subclip_items:
+            continue
+
+        scene_elapsed = 0.0
+        for item_index, subclip_item in enumerate(subclip_items, start=1):
+            remaining = scene_duration - scene_elapsed
+            if remaining <= 0.2:
+                break
+            try:
+                clip = prepare_clip(
+                    subclip_item,
+                    duration_limit=min(max_clip_duration, remaining),
+                )
+                clip_file = os.path.join(
+                    output_dir, f"temp-scene-{scene_index}-{item_index}.mp4"
+                )
+                clip.write_videofile(clip_file, logger=None, fps=fps, codec=video_codec)
+                clip_duration_saved = clip.duration
+                close_clip(clip)
+                processed_clips.append(
+                    SubClippedVideoClip(
+                        file_path=clip_file,
+                        duration=clip_duration_saved,
+                    )
+                )
+                scene_elapsed += clip_duration_saved
+            except Exception as e:
+                logger.error(f"failed to process scene clip: {str(e)}")
+                break
+        if scene_elapsed < scene_duration:
+            logger.warning(
+                f"scene {scene_index} duration ({scene_elapsed:.2f}s) is shorter than "
+                f"target ({scene_duration:.2f}s); not repeating materials."
+            )
+
+    total_duration = sum(clip.duration for clip in processed_clips)
+    if processed_clips and total_duration < audio_duration:
+        logger.warning(
+            f"scene video duration ({total_duration:.2f}s) is shorter than audio duration "
+            f"({audio_duration:.2f}s); not looping tail clips to avoid repeated materials."
+        )
+
+    if not processed_clips:
+        raise RuntimeError("no scene clips available for merging")
+
+    clip_files = [clip.file_path for clip in processed_clips]
+    concat_video_clips_with_ffmpeg(
+        clip_files=clip_files,
+        output_file=combined_video_path,
+        threads=threads,
+        output_dir=output_dir,
+    )
+    delete_files(clip_files)
+    logger.info("scene video combining completed")
     return combined_video_path
 
 

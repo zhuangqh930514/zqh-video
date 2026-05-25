@@ -278,3 +278,23 @@ upload_post_platforms = ["tiktok", "instagram"]
 
 # Automatically cross-post videos after generation (if false, you'll need to call the API manually)
 upload_post_auto_upload = false
+
+########## Douyin Official API (Publish to 抖音)
+# Requires a Douyin Open Platform app with the "video.create.bind" scope approved.
+# Docs: https://developer.open-douyin.com/docs/resource/zh-CN/dop/develop/openapi/video-management/douyin/create-video/video-create
+#
+# Setup:
+# 1. Create a website/mobile app at https://open.douyin.com/
+# 2. Apply for "视频发布" capability and pass review
+# 3. Set redirect_uri in the console to match douyin_redirect_uri below (HTTPS in production)
+# 4. Authorize once via WebUI "Connect Douyin Account"
+
+douyin_enabled = false
+douyin_client_key = ""
+douyin_client_secret = ""
+# Example: http://127.0.0.1:8080/api/v1/douyin/oauth/callback
+douyin_redirect_uri = ""
+douyin_scope = "video.create.bind"
+# 0=public, 1=private, 2=friends only
+douyin_private_status = 0
+douyin_auto_publish = false
